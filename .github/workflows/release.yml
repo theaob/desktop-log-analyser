@@ -1,12 +1,14 @@
 name: Release
 
 # Builds the Windows and Linux installers. Pushing a version tag (v0.1.0)
-# attaches them to a draft GitHub Release; a manual run only uploads them as
-# workflow artifacts. Pushes to main and PRs already get installers from the
-# bundle job in ci.yml.
+# attaches them to a draft GitHub Release; a manual run, or a PR that edits
+# this file, only uploads them as workflow artifacts. Pushes to main and PRs
+# already get installers from the bundle job in ci.yml.
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths: [.github/workflows/release.yml]
   workflow_dispatch:
 
 concurrency:
