@@ -99,6 +99,8 @@ pub struct CompiledQuery {
     /// to skip chunks without decoding them.
     pub required_literals: Vec<memmem::Finder<'static>>,
     pub has_parsers: bool,
+    /// Bloom keys of exact, non-empty per-event matchers; a chunk must may-contain all.
+    pub bloom_keys: Vec<u64>,
 }
 
 fn compile_expr(e: &FieldExpr) -> anyhow::Result<CExpr> {
@@ -182,13 +184,25 @@ impl CompiledQuery {
                 Stage::Filter { expr } => CompiledStage::Filter(compile_expr(expr)?),
             });
         }
+        let bloom_keys = q
+            .selector
+            .iter()
+            .filter(|m| m.op == MatchOp::Eq && !m.value.is_empty() && !STREAM_LABELS.contains(&m.name.as_str()))
+            .map(|m| crate::bloom::key_hash(&m.name, &m.value))
+            .collect();
         Ok(CompiledQuery {
             stream,
             event,
             stages,
             required_literals,
             has_parsers,
+            bloom_keys,
         })
+    }
+
+    /// False when the chunk's Bloom filter rules out an exact matcher.
+    pub fn bloom_matches(&self, filter: &[u8]) -> bool {
+        self.bloom_keys.iter().all(|k| crate::bloom::may_contain(filter, *k))
     }
 
     /// Checks stream matchers against a chunk's labels.
@@ -374,7 +388,7 @@ fn extract_json(message: &str, out: &mut Vec<(String, String)>) {
 }
 
 /// `| logfmt`: `key=value key2="quoted value"` pairs; tokens without `=` are skipped.
-fn extract_logfmt(line: &str, out: &mut Vec<(String, String)>) {
+pub(crate) fn extract_logfmt(line: &str, out: &mut Vec<(String, String)>) {
     let b = line.as_bytes();
     let mut i = 0;
     while i < b.len() {

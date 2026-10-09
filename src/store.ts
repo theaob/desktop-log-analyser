@@ -29,8 +29,11 @@ interface State {
   total: number | null;
   histogram: Histogram | null;
   tookMs: number;
+  countMs: number;
   next: RowKey | null;
   loading: boolean;
+  /** The count and histogram for the current query are still being computed. */
+  counting: boolean;
   loadingMore: boolean;
   error: string | null;
   expanded: Record<string, boolean>;
@@ -63,8 +66,10 @@ export const useStore = create<State>((set, get) => ({
   total: null,
   histogram: null,
   tookMs: 0,
+  countMs: 0,
   next: null,
   loading: false,
+  counting: false,
   loadingMore: false,
   error: null,
   expanded: {},
@@ -104,14 +109,23 @@ export const useStore = create<State>((set, get) => ({
       set({ queryError: parsed.error, loading: false });
       return;
     }
-    set({ parsedQuery: parsed.query, queryError: null });
+    set({ parsedQuery: parsed.query, queryError: null, counting: true });
+    // Rows come back as soon as the first page is found; the count and histogram need the
+    // whole range and arrive later. The old histogram stays up meanwhile.
+    const counted = api.aggregate(req).then(
+      (agg) => {
+        if (my !== seq || agg.cancelled) return;
+        set({ total: agg.total, histogram: agg.histogram, countMs: agg.tookMs, counting: false });
+      },
+      () => {
+        if (my === seq) set({ counting: false });
+      },
+    );
     try {
       const res = await api.search({ ...req, limit: PAGE });
       if (my !== seq || res.cancelled) return;
       set({
         rows: res.rows,
-        total: res.total,
-        histogram: res.histogram,
         tookMs: res.tookMs,
         next: res.next,
         loading: false,
@@ -124,6 +138,7 @@ export const useStore = create<State>((set, get) => ({
       if (err?.kind === "query") set({ queryError: err, loading: false });
       else set({ error: errorMessage(e), loading: false });
     }
+    await counted;
   },
 
   loadMore: async () => {
@@ -132,7 +147,7 @@ export const useStore = create<State>((set, get) => ({
     const my = seq;
     set({ loadingMore: true });
     try {
-      const res = await api.search({ ...get().searchRequest(), limit: PAGE, after: next, rowsOnly: true });
+      const res = await api.search({ ...get().searchRequest(), limit: PAGE, after: next });
       if (my !== seq) return;
       set((s) => ({ rows: [...s.rows, ...res.rows], next: res.next, loadingMore: false }));
     } catch (e) {

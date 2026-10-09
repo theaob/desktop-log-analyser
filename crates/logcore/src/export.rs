@@ -90,7 +90,6 @@ pub fn export(
         &q,
         from,
         to,
-        |_| true,
         cancel,
         Vec::new,
         |keys: &mut Vec<RowKey>, ci, _, idx, ev, _| {

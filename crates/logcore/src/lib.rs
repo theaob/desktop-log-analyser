@@ -2,9 +2,11 @@
 //! Logback / JSON / plain text logs into events, stores them in compressed chunks, and runs
 //! LogQL-style queries with a level-stacked volume histogram.
 
+pub mod bloom;
 pub mod chunk;
 pub mod discover;
 pub mod export;
+pub mod formats;
 pub mod ingest;
 pub mod labels;
 pub mod log4j;

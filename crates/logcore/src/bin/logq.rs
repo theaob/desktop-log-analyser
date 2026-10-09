@@ -82,7 +82,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     req.query = query;
-    let res = logcore::search(&ws, &req, &AtomicBool::new(false))?;
+    let no_cancel = AtomicBool::new(false);
+    let res = logcore::search::rows(&ws, &req, &no_cancel)?;
     for r in &res.rows {
         let first = r.message.lines().next().unwrap_or("");
         let extra = r.message.lines().count().saturating_sub(1);
@@ -94,13 +95,17 @@ fn main() -> anyhow::Result<()> {
         println!("{:>5} {}{more}", r.level.as_str(), first);
     }
     eprintln!(
-        "{} matches, {} rows shown, {}/{} chunks scanned, {} events scanned, {} ms",
-        res.total.unwrap_or(0),
+        "first page: {} rows, {}/{} chunks scanned, {} events scanned, {} ms",
         res.rows.len(),
         res.chunks_scanned,
         res.chunks_total,
         res.events_scanned,
         res.took_ms
+    );
+    let aggs = logcore::search::aggregate(&ws, &req, &no_cancel)?;
+    eprintln!(
+        "count: {} matches, {}/{} chunks scanned, {} events scanned, {} ms",
+        aggs.total, aggs.chunks_scanned, aggs.chunks_total, aggs.events_scanned, aggs.took_ms
     );
     Ok(())
 }

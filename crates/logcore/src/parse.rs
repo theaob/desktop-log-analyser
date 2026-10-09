@@ -1,6 +1,7 @@
 //! Turning lines into events: format detection, first-line parsing and multi-line grouping
 //! (stack traces and other continuation lines are appended to the previous event).
 
+use crate::formats::{finish_xml, is_xml_wrapper, parse_logfmt, parse_syslog, parse_xml_start};
 use crate::log4j::{json_keys, Capture, CompiledPattern, COMMON_PATTERNS};
 use crate::model::{Event, Level};
 use crate::time::{assemble, DateParts, GenericTimestamp, TzMode};
@@ -18,6 +19,12 @@ pub enum Format {
     Log4j(Arc<CompiledPattern>),
     /// One JSON object per line (JsonTemplateLayout, compact JSONLayout, Logstash encoder).
     JsonLines,
+    /// log4j 1.x XMLLayout or log4j 2 XmlLayout; one event spans several lines.
+    Xml,
+    /// RFC 5424 or RFC 3164 (BSD) syslog lines.
+    Syslog,
+    /// `key=value` pairs with a time or level key.
+    Logfmt,
     /// Unknown text: generic timestamp and level detection. `timestamped` means events start
     /// at lines with a leading timestamp; otherwise every line is an event.
     Plain { timestamped: bool },
@@ -29,6 +36,9 @@ pub enum Format {
 pub enum FormatInfo {
     Log4j { pattern: String },
     JsonLines,
+    Xml,
+    Syslog,
+    Logfmt,
     Plain { timestamped: bool },
 }
 
@@ -39,6 +49,9 @@ impl Format {
                 pattern: p.pattern.clone(),
             },
             Format::JsonLines => FormatInfo::JsonLines,
+            Format::Xml => FormatInfo::Xml,
+            Format::Syslog => FormatInfo::Syslog,
+            Format::Logfmt => FormatInfo::Logfmt,
             Format::Plain { timestamped } => FormatInfo::Plain {
                 timestamped: *timestamped,
             },
@@ -49,6 +62,9 @@ impl Format {
         match self {
             Format::Log4j(_) => "log4j",
             Format::JsonLines => "json",
+            Format::Xml => "xml",
+            Format::Syslog => "syslog",
+            Format::Logfmt => "logfmt",
             Format::Plain { .. } => "plain",
         }
     }
@@ -92,6 +108,9 @@ impl Format {
         match self {
             Format::Log4j(p) => parse_log4j(p, line, ctx),
             Format::JsonLines => parse_json(line, ctx),
+            Format::Xml => parse_xml_start(line),
+            Format::Syslog => parse_syslog(line, ctx, generic_ts(), level_word()),
+            Format::Logfmt => parse_logfmt(line, ctx, generic_ts()),
             Format::Plain { timestamped } => {
                 let found = generic_ts().find(line, ctx.tz, ctx.default_date);
                 if *timestamped && found.is_none() {
@@ -312,6 +331,9 @@ impl<'a> Assembler<'a> {
     /// Feeds one line (without its line terminator). Returns an event when `line` started a
     /// new one and the previous event is complete.
     pub fn push(&mut self, line: &str, line_no: u32) -> Option<Event> {
+        if matches!(self.format, Format::Xml) && is_xml_wrapper(line) {
+            return None;
+        }
         if let Some(mut ev) = self.format.parse_start(line, &self.ctx) {
             ev.line_no = line_no;
             if ev.ts_inferred {
@@ -319,7 +341,8 @@ impl<'a> Assembler<'a> {
             } else {
                 self.last_ts = ev.ts;
             }
-            return self.current.replace(ev);
+            let done = self.current.replace(ev);
+            return done.map(|e| self.complete(e));
         }
         match &mut self.current {
             Some(ev) => {
@@ -343,7 +366,16 @@ impl<'a> Assembler<'a> {
     }
 
     pub fn finish(&mut self) -> Option<Event> {
-        self.current.take()
+        let done = self.current.take();
+        done.map(|e| self.complete(e))
+    }
+
+    fn complete(&self, mut ev: Event) -> Event {
+        // Lines before the first event are kept as they are.
+        if matches!(self.format, Format::Xml) && parse_xml_start(ev.message.lines().next().unwrap_or("")).is_some() {
+            finish_xml(&mut ev);
+        }
+        ev
     }
 }
 
@@ -413,6 +445,15 @@ pub fn detect(sample: &[String], user_patterns: &[Arc<CompiledPattern>], ctx: &P
             score: js,
         };
     }
+    // XML events span many lines, so look at the first line that isn't document wrapper.
+    if let Some(first) = lines.iter().find(|l| !is_xml_wrapper(l)) {
+        if parse_xml_start(first).is_some() {
+            return Detection {
+                format: Format::Xml,
+                score: score(&Format::Xml),
+            };
+        }
+    }
     for p in COMMON_PATTERNS {
         let Ok(c) = CompiledPattern::compile(p) else {
             continue;
@@ -426,6 +467,12 @@ pub fn detect(sample: &[String], user_patterns: &[Arc<CompiledPattern>], ctx: &P
     }
     if let Some(b) = best {
         return b;
+    }
+    for f in [Format::Syslog, Format::Logfmt] {
+        let s = score(&f);
+        if s >= 0.5 {
+            return Detection { format: f, score: s };
+        }
     }
     let plain_ts = Format::Plain { timestamped: true };
     let s = score(&plain_ts);

@@ -1,6 +1,7 @@
 //! Chunk encoding. A chunk holds up to [`CHUNK_EVENTS`] events of one file and one level,
 //! LZ4-compressed, stored back to back in the workspace's segment file.
 
+use crate::bloom;
 use crate::model::Event;
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,18 @@ pub struct ChunkMeta {
     pub count: u32,
     pub offset: u64,
     pub len: u32,
+    /// Location of the chunk's field Bloom filter in `blooms.bin`.
+    pub bloom_offset: u64,
+    pub bloom_len: u32,
+}
+
+/// An encoded chunk ready to be written.
+pub struct FinishedChunk {
+    pub bytes: Vec<u8>,
+    pub bloom: Vec<u8>,
+    pub count: u32,
+    pub min_ts: i64,
+    pub max_ts: i64,
 }
 
 /// A decoded event borrowing from a decompressed chunk buffer.
@@ -60,6 +73,7 @@ pub struct ChunkBuilder {
     prev_ts: i64,
     pub min_ts: i64,
     pub max_ts: i64,
+    keys: std::collections::HashSet<u64>,
 }
 
 impl ChunkBuilder {
@@ -78,10 +92,20 @@ impl ChunkBuilder {
         put_str(&mut self.buf, &ev.logger);
         put_str(&mut self.buf, &ev.thread);
         put_str(&mut self.buf, &ev.exception);
+        for (name, value) in [
+            ("logger", &ev.logger),
+            ("thread", &ev.thread),
+            ("exception", &ev.exception),
+        ] {
+            if !value.is_empty() {
+                self.keys.insert(bloom::key_hash(name, value));
+            }
+        }
         put_varint(&mut self.buf, ev.fields.len() as u64);
         for (k, v) in &ev.fields {
             put_str(&mut self.buf, k);
             put_str(&mut self.buf, v);
+            self.keys.insert(bloom::key_hash(k, v));
         }
         put_str(&mut self.buf, &ev.message);
         self.count += 1;
@@ -99,13 +123,19 @@ impl ChunkBuilder {
         self.count as usize >= CHUNK_EVENTS || self.buf.len() >= CHUNK_RAW_BYTES
     }
 
-    /// Returns (compressed bytes, count, min_ts, max_ts) and resets the builder.
-    pub fn finish(&mut self) -> (Vec<u8>, u32, i64, i64) {
+    /// Compresses the chunk, builds its Bloom filter and resets the builder.
+    pub fn finish(&mut self) -> FinishedChunk {
         let mut body = Vec::with_capacity(self.buf.len() + 8);
         put_varint(&mut body, self.count as u64);
         body.extend_from_slice(&self.buf);
-        let compressed = lz4_flex::compress_prepend_size(&body);
-        let out = (compressed, self.count, self.min_ts, self.max_ts);
+        let keys: Vec<u64> = self.keys.iter().copied().collect();
+        let out = FinishedChunk {
+            bytes: lz4_flex::compress_prepend_size(&body),
+            bloom: bloom::build(&keys),
+            count: self.count,
+            min_ts: self.min_ts,
+            max_ts: self.max_ts,
+        };
         *self = ChunkBuilder::default();
         out
     }
@@ -224,9 +254,11 @@ mod tests {
         };
         b.push(&e1);
         b.push(&e2);
-        let (bytes, count, min, max) = b.finish();
-        assert_eq!((count, min, max), (2, 900, 1000));
-        let body = decompress(&bytes).unwrap();
+        let done = b.finish();
+        assert_eq!((done.count, done.min_ts, done.max_ts), (2, 900, 1000));
+        assert!(bloom::may_contain(&done.bloom, bloom::key_hash("k", "v")));
+        assert!(bloom::may_contain(&done.bloom, bloom::key_hash("thread", "main")));
+        let body = decompress(&done.bytes).unwrap();
         let evs = decode(&body).unwrap();
         assert_eq!(evs[0].ts, 1000);
         assert_eq!(evs[0].fields, vec![("k", "v")]);

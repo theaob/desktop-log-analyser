@@ -14,6 +14,7 @@ function cssVar(name: string): string {
 export default function Histogram() {
   const histogram = useStore((s) => s.histogram);
   const total = useStore((s) => s.total);
+  const counting = useStore((s) => s.counting);
   const setRange = useStore((s) => s.setRange);
   const host = useRef<HTMLDivElement>(null);
   const plot = useRef<uPlot | null>(null);
@@ -105,7 +106,7 @@ export default function Histogram() {
           </>
         ) : (
           <>
-            <span>{total !== null ? `${formatCount(total)} lines` : ""}</span>
+            <span>{total !== null && !counting ? `${formatCount(total)} lines` : "Counting…"}</span>
             {prepared?.present.map((l) => (
               <span key={l} className={`lvl-text-${l}`}>
                 ■ {l}

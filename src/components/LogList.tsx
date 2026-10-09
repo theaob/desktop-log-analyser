@@ -89,6 +89,7 @@ export default function LogList() {
   const loadingMore = useStore((s) => s.loadingMore);
   const loading = useStore((s) => s.loading);
   const total = useStore((s) => s.total);
+  const counting = useStore((s) => s.counting);
   const parsedQuery = useStore((s) => s.parsedQuery);
   const re = useMemo(() => highlightTerms(parsedQuery), [parsedQuery]);
   const scroller = useRef<HTMLDivElement>(null);
@@ -116,7 +117,9 @@ export default function LogList() {
     <section className="loglist">
       <div className="loglist-toolbar">
         <span className="muted">
-          {total !== null && `Showing ${formatCount(rows.length)} of ${formatCount(total)}`}
+          {counting || total === null
+            ? `Showing ${formatCount(rows.length)}${next ? "+" : ""}`
+            : `Showing ${formatCount(rows.length)} of ${formatCount(total)}`}
           {loading && " · running…"}
         </span>
         <label className="toggle">
