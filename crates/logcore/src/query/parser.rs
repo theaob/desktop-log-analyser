@@ -569,6 +569,37 @@ pub fn parse(src: &str) -> Result<Query, ParseError> {
 mod tests {
     use super::*;
 
+    /// The visual builder sends trees in this shape to `format_query`: durations and sizes
+    /// ride in `text` on a placeholder number, which the formatter writes verbatim.
+    #[test]
+    fn formats_builder_trees() {
+        let json = r#"{"selector":[{"name":"level","op":"=~","value":"warn|error"}],"stages":[
+            {"type":"line","op":"|=","values":["timeout","refused"]},
+            {"type":"json"},
+            {"type":"filter","expr":{"type":"cmp","name":"status","op":">=","value":{"type":"number","value":500},"text":""}},
+            {"type":"filter","expr":{"type":"cmp","name":"took","op":">","value":{"type":"number","value":0},"text":"250ms"}},
+            {"type":"filter","expr":{"type":"cmp","name":"size","op":"<","value":{"type":"number","value":0},"text":"10MB"}},
+            {"type":"filter","expr":{"type":"cmp","name":"user","op":"==","value":{"type":"string","value":"42"},"text":""}}
+        ]}"#;
+        let q: Query = serde_json::from_str(json).unwrap();
+        let text = q.to_string();
+        assert_eq!(
+            text,
+            r#"{level=~"warn|error"} |= "timeout" or "refused" | json | status >= 500 | took > 250ms | size < 10MB | user == "42""#
+        );
+        let back = parse(&text).unwrap();
+        match &back.stages[3] {
+            Stage::Filter {
+                expr:
+                    FieldExpr::Cmp {
+                        value: Value::Duration(ms),
+                        ..
+                    },
+            } => assert_eq!(*ms, 250.0),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn full_query() {
         let q = parse(r#"{source="app.log", level=~"error|warn", file!~".*debug.*"} |= "timeout" or "refused" !~ "healthcheck" | json | status >= 500 and duration > 2s"#).unwrap();

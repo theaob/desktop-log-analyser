@@ -428,19 +428,146 @@ table.sample td:nth-child(4) {
 .builder {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
-.builder-row {
+.builder-section {
   display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+.builder-section-title {
+  flex: 0 0 90px;
+  padding-top: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.builder-labels,
+.builder-ops {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+}
+.builder-ops {
+  flex-direction: column;
+  align-items: stretch;
+}
+.builder-ops > .add-op {
+  align-self: flex-start;
+}
+.builder-chip {
+  display: flex;
+  gap: 2px;
+  align-items: center;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px;
+}
+.op-card {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 6px 6px;
+}
+.op-head {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.op-title {
+  font-weight: 600;
+}
+.op-hint {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.op-actions {
+  display: flex;
+  gap: 2px;
+}
+.op-body {
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   align-items: center;
 }
-.builder-row input {
-  min-width: 240px;
+.op-body code {
+  font-family: var(--mono);
+}
+.line-value {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+.combobox {
+  position: relative;
+  display: inline-flex;
+}
+.combobox.name input {
+  width: 130px;
+}
+.combobox.value input {
+  width: 200px;
+}
+.combobox-list {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 20;
+  min-width: 100%;
+  max-width: 420px;
+  max-height: 260px;
+  overflow-y: auto;
+  margin: 2px 0 0;
+  padding: 2px 0;
+  list-style: none;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+.combobox-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.combobox-list li .value-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.combobox-list li.active {
+  background: color-mix(in srgb, var(--accent) 25%, transparent);
+}
+input.invalid {
+  border-color: var(--danger);
+}
+.field-error {
+  color: var(--danger);
+  font-size: 11px;
+}
+.builder-footer {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  border-top: 1px solid var(--border);
+  padding-top: 6px;
 }
 .query-preview {
+  flex: 1;
   color: var(--muted);
   word-break: break-all;
+  font-family: var(--mono);
 }
 
 /* Histogram */
