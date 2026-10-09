@@ -42,6 +42,9 @@ jobs:
       - name: Type-check and build the UI
         run: npm run build
 
+      - name: UI unit tests
+        run: npm test
+
       - name: Rust format
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
