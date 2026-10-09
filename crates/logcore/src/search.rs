@@ -1,5 +1,12 @@
-//! Running a query over a workspace: chunk pruning, a parallel scan, top-N rows for the
-//! requested page, a total count and a level-stacked histogram, all in one pass.
+//! Running a query over a workspace. Two independent phases the UI runs concurrently:
+//!
+//! - [`rows`]: the requested page. Candidate chunks are visited in time order (newest first for
+//!   backward) in parallel batches, and the scan stops as soon as no remaining chunk can hold a
+//!   row better than the worst one kept. First results come back without reading the whole folder.
+//! - [`aggregate`]: total count and level-stacked histogram, which need every matching event.
+//!
+//! Both prune chunks by time, stream labels (source, file, level) and per-chunk Bloom filters
+//! for exact field matchers, then skip chunks missing a required `|=` literal before decoding.
 
 use crate::chunk::{decode, ChunkMeta, EventRef};
 use crate::model::Level;
@@ -45,7 +52,7 @@ pub struct SearchRequest {
     pub direction: Direction,
     /// Return rows after this key (in `direction` order), for "load more".
     pub after: Option<RowKey>,
-    /// Skip the count and histogram (used when only paging).
+    /// [`search`] only: skip the count and histogram (used when only paging).
     pub rows_only: bool,
 }
 
@@ -179,22 +186,76 @@ impl Ord for Cand {
     }
 }
 
-struct Acc {
-    /// Min-heap on goodness: the top is the worst kept row.
-    heap: BinaryHeap<Reverse<Cand>>,
-    total: u64,
-    buckets: Vec<[u64; 7]>,
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Aggregates {
+    pub total: u64,
+    pub histogram: Histogram,
+    pub took_ms: u64,
+    pub chunks_scanned: u64,
+    pub chunks_total: u64,
+    pub events_scanned: u64,
+    pub cancelled: bool,
+}
+
+/// Chunks that can hold a match: time range, stream labels, Bloom filter and `extra`.
+pub(crate) fn candidates(
+    ws: &Workspace,
+    q: &CompiledQuery,
+    from: i64,
+    to: i64,
+    extra: impl Fn(&ChunkMeta) -> bool,
+) -> Vec<u32> {
+    ws.meta
+        .chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.max_ts >= from && c.min_ts < to && extra(c))
+        .filter(|(_, c)| {
+            let f = ws.file(c.file);
+            q.chunk_matches(&f.file.source, &f.file.rel, Level::from_u8(c.level))
+        })
+        .filter(|(_, c)| q.bloom_matches(ws.bloom(c)))
+        .map(|(i, _)| i as u32)
+        .collect()
+}
+
+/// Reads one chunk and calls `visit` for each matching event in the time range.
+/// Returns the number of events decoded (0 when the literal prefilter skipped the chunk).
+fn scan_chunk(
+    ws: &Workspace,
+    q: &CompiledQuery,
+    ci: u32,
+    from: i64,
+    to: i64,
+    mut visit: impl FnMut(&ChunkMeta, u32, &EventRef, Vec<(String, String)>),
+) -> anyhow::Result<u64> {
+    let meta = &ws.meta.chunks[ci as usize];
+    let body = ws.read_chunk(meta)?;
+    if !q.required_literals.iter().all(|f| f.find(&body).is_some()) {
+        return Ok(0);
+    }
+    let decoded = decode(&body)?;
+    let level = Level::from_u8(meta.level);
+    for (i, ev) in decoded.iter().enumerate() {
+        if ev.ts < from || ev.ts >= to {
+            continue;
+        }
+        if let Some(parsed) = q.eval(ev, level) {
+            visit(meta, i as u32, ev, parsed);
+        }
+    }
+    Ok(decoded.len() as u64)
 }
 
 /// Visits every event in the time range matching the query, in no particular order.
-/// Used by search and export.
-#[allow(clippy::too_many_arguments)]
+/// Returns one `(state, chunks scanned, events decoded)` per rayon fold. Used by aggregates
+/// and export.
 pub(crate) fn scan_chunks<F>(
     ws: &Workspace,
     q: &CompiledQuery,
     from: i64,
     to: i64,
-    extra_prune: impl Fn(&ChunkMeta) -> bool + Sync,
     cancel: &AtomicBool,
     init: impl Fn() -> F + Sync + Send,
     visit: impl Fn(&mut F, u32, &ChunkMeta, u32, &EventRef, Vec<(String, String)>) + Sync + Send,
@@ -202,20 +263,9 @@ pub(crate) fn scan_chunks<F>(
 where
     F: Send,
 {
-    let candidates: Vec<u32> = ws
-        .meta
-        .chunks
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.max_ts >= from && c.min_ts < to && extra_prune(c))
-        .filter(|(_, c)| {
-            let f = ws.file(c.file);
-            q.chunk_matches(&f.file.source, &f.file.rel, Level::from_u8(c.level))
-        })
-        .map(|(i, _)| i as u32)
-        .collect();
+    let cands = candidates(ws, q, from, to, |_| true);
     let error: parking_lot::Mutex<Option<anyhow::Error>> = parking_lot::Mutex::new(None);
-    let out = candidates
+    let out = cands
         .par_iter()
         .fold(
             || (init(), 0u64, 0u64),
@@ -223,34 +273,14 @@ where
                 if cancel.load(Ordering::Relaxed) {
                     return (state, scanned, events);
                 }
-                let meta = &ws.meta.chunks[ci as usize];
-                let body = match ws.read_chunk(meta) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        *error.lock() = Some(e);
-                        return (state, scanned, events);
+                match scan_chunk(ws, q, ci, from, to, |meta, idx, ev, parsed| {
+                    visit(&mut state, ci, meta, idx, ev, parsed)
+                }) {
+                    Ok(n) => {
+                        scanned += 1;
+                        events += n;
                     }
-                };
-                scanned += 1;
-                if !q.required_literals.iter().all(|f| f.find(&body).is_some()) {
-                    return (state, scanned, events);
-                }
-                let decoded = match decode(&body) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        *error.lock() = Some(e);
-                        return (state, scanned, events);
-                    }
-                };
-                let level = Level::from_u8(meta.level);
-                events += decoded.len() as u64;
-                for (i, ev) in decoded.iter().enumerate() {
-                    if ev.ts < from || ev.ts >= to {
-                        continue;
-                    }
-                    if let Some(parsed) = q.eval(ev, level) {
-                        visit(&mut state, ci, meta, i as u32, ev, parsed);
-                    }
+                    Err(e) => *error.lock() = Some(e),
                 }
                 (state, scanned, events)
             },
@@ -281,91 +311,118 @@ pub fn make_row(ws: &Workspace, key: RowKey, meta: &ChunkMeta, ev: &EventRef, pa
     }
 }
 
-pub fn search(ws: &Workspace, req: &SearchRequest, cancel: &AtomicBool) -> Result<SearchResult, SearchError> {
+/// Keeps the best `cap` rows; the heap top is the worst kept one.
+struct TopK {
+    heap: BinaryHeap<Reverse<Cand>>,
+    cap: usize,
+}
+
+impl TopK {
+    fn new(cap: usize) -> Self {
+        TopK {
+            heap: BinaryHeap::new(),
+            cap,
+        }
+    }
+
+    fn would_keep(&self, g: Goodness) -> bool {
+        self.heap.len() < self.cap || self.heap.peek().is_some_and(|w| g > w.0.g)
+    }
+
+    fn push(&mut self, c: Cand) {
+        if self.heap.len() >= self.cap {
+            self.heap.pop();
+        }
+        self.heap.push(Reverse(c));
+    }
+
+    fn worst(&self) -> Option<Goodness> {
+        (self.heap.len() >= self.cap)
+            .then(|| self.heap.peek().map(|w| w.0.g))
+            .flatten()
+    }
+}
+
+/// Returns the requested page of rows, scanning only as many chunks as needed.
+pub fn rows(ws: &Workspace, req: &SearchRequest, cancel: &AtomicBool) -> Result<SearchResult, SearchError> {
     let started = Instant::now();
-    let query = parse(&req.query)?;
-    let q = CompiledQuery::compile(&query)?;
+    let q = CompiledQuery::compile(&parse(&req.query)?)?;
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, 10_000);
     let from = req.from.unwrap_or(i64::MIN);
     let to = req.to.unwrap_or(i64::MAX);
     let dir = req.direction;
     let after = req.after;
-
-    // Histogram over the requested range, or the whole folder when unbounded.
-    let h_from = req.from.or(ws.meta.stats.min_ts).unwrap_or(0);
-    let h_to = req.to.or(ws.meta.stats.max_ts.map(|t| t + 1)).unwrap_or(h_from + 1);
-    let step = bucket_step(h_from, h_to);
-    let h_start = h_from.div_euclid(step) * step;
-    let n_buckets = ((h_to - h_start + step - 1) / step).max(1) as usize;
-    let want_aggs = !req.rows_only;
-
-    // When only paging, chunks entirely on the wrong side of the cursor can be skipped.
-    let prune = |c: &ChunkMeta| match (want_aggs, after) {
-        (false, Some(a)) => match dir {
-            Direction::Backward => c.min_ts <= a.ts,
-            Direction::Forward => c.max_ts >= a.ts,
-        },
-        _ => true,
-    };
     let after_g = after.map(|a| goodness(a, dir));
 
-    let parts = scan_chunks(
-        ws,
-        &q,
-        from,
-        to,
-        prune,
-        cancel,
-        || Acc {
-            heap: BinaryHeap::new(),
-            total: 0,
-            buckets: if want_aggs { vec![[0; 7]; n_buckets] } else { vec![] },
-        },
-        |acc, ci, meta, idx, ev, parsed| {
-            acc.total += 1;
-            if want_aggs {
-                let b = ((ev.ts - h_start) / step).clamp(0, n_buckets as i64 - 1) as usize;
-                acc.buckets[b][meta.level as usize] += 1;
-            }
-            let key = RowKey {
-                ts: ev.ts,
-                chunk: ci,
-                idx,
-            };
-            let g = goodness(key, dir);
-            // Rows at or before the cursor were already returned.
-            if after_g.is_some_and(|a| g >= a) {
-                return;
-            }
-            if acc.heap.len() > limit {
-                if acc.heap.peek().is_some_and(|w| g <= w.0.g) {
-                    return;
-                }
-                acc.heap.pop();
-            }
-            acc.heap.push(Reverse(Cand {
-                g,
-                row: make_row(ws, key, meta, ev, parsed),
-            }));
-        },
-    )?;
+    // Chunks entirely on the wrong side of the cursor were already returned.
+    let mut cands = candidates(ws, &q, from, to, |c| match (after, dir) {
+        (None, _) => true,
+        (Some(a), Direction::Backward) => c.min_ts <= a.ts,
+        (Some(a), Direction::Forward) => c.max_ts >= a.ts,
+    });
+    // Best chunk first: the best row a chunk can hold has its max_ts (backward) or min_ts (forward).
+    let best_ts = |ci: u32| {
+        let c = &ws.meta.chunks[ci as usize];
+        match dir {
+            Direction::Backward => c.max_ts,
+            Direction::Forward => -c.min_ts,
+        }
+    };
+    cands.sort_by_key(|&ci| Reverse(best_ts(ci)));
 
-    let mut total = 0u64;
+    // One extra row tells whether there is a next page.
+    let mut top = TopK::new(limit + 1);
     let mut chunks_scanned = 0u64;
     let mut events_scanned = 0u64;
-    let mut buckets = if want_aggs { vec![[0u64; 7]; n_buckets] } else { vec![] };
-    let mut all: Vec<Cand> = Vec::new();
-    for (acc, scanned, events) in parts {
-        total += acc.total;
-        chunks_scanned += scanned;
-        events_scanned += events;
-        for (b, src) in buckets.iter_mut().zip(&acc.buckets) {
-            for l in 0..7 {
-                b[l] += src[l];
+    let mut pos = 0;
+    let mut batch = rayon::current_num_threads().max(2);
+    while pos < cands.len() && !cancel.load(Ordering::Relaxed) {
+        // A chunk can't beat the worst kept row when its best timestamp is strictly worse
+        // (equal timestamps may still win on the chunk/index tiebreak).
+        if let Some(w) = top.worst() {
+            if best_ts(cands[pos]) < w.0 {
+                break;
             }
         }
-        all.extend(acc.heap.into_iter().map(|r| r.0));
+        let end = (pos + batch).min(cands.len());
+        let threshold = top.worst();
+        let parts: Vec<anyhow::Result<(Vec<Cand>, u64)>> = cands[pos..end]
+            .par_iter()
+            .map(|&ci| {
+                let mut local = TopK::new(limit + 1);
+                let n = scan_chunk(ws, &q, ci, from, to, |meta, idx, ev, parsed| {
+                    let key = RowKey {
+                        ts: ev.ts,
+                        chunk: ci,
+                        idx,
+                    };
+                    let g = goodness(key, dir);
+                    if after_g.is_some_and(|a| g >= a) || threshold.is_some_and(|t| g <= t) || !local.would_keep(g) {
+                        return;
+                    }
+                    local.push(Cand {
+                        g,
+                        row: make_row(ws, key, meta, ev, parsed),
+                    });
+                })?;
+                Ok((local.heap.into_iter().map(|r| r.0).collect(), n))
+            })
+            .collect();
+        for part in parts {
+            let (cands, n) = part?;
+            chunks_scanned += 1;
+            events_scanned += n;
+            for c in cands {
+                if top.would_keep(c.g) {
+                    top.push(c);
+                }
+            }
+        }
+        pos = end;
+        batch = (batch * 2).min(256);
     }
+
+    let mut all: Vec<Cand> = top.heap.into_iter().map(|r| r.0).collect();
     all.sort_by_key(|c| Reverse(c.g));
     let has_more = all.len() > limit;
     all.truncate(limit);
@@ -373,12 +430,8 @@ pub fn search(ws: &Workspace, req: &SearchRequest, cancel: &AtomicBool) -> Resul
     let next = if has_more { rows.last().map(|r| r.key) } else { None };
     Ok(SearchResult {
         rows,
-        total: want_aggs.then_some(total),
-        histogram: want_aggs.then_some(Histogram {
-            start: h_start,
-            step,
-            buckets,
-        }),
+        total: None,
+        histogram: None,
         took_ms: started.elapsed().as_millis() as u64,
         chunks_scanned,
         chunks_total: ws.meta.chunks.len() as u64,
@@ -386,4 +439,74 @@ pub fn search(ws: &Workspace, req: &SearchRequest, cancel: &AtomicBool) -> Resul
         next,
         cancelled: cancel.load(Ordering::Relaxed),
     })
+}
+
+/// Total matches and the level-stacked histogram over the requested range (or the whole
+/// folder when unbounded). Ignores `limit`, `direction` and `after`.
+pub fn aggregate(ws: &Workspace, req: &SearchRequest, cancel: &AtomicBool) -> Result<Aggregates, SearchError> {
+    let started = Instant::now();
+    let q = CompiledQuery::compile(&parse(&req.query)?)?;
+    let from = req.from.unwrap_or(i64::MIN);
+    let to = req.to.unwrap_or(i64::MAX);
+    let h_from = req.from.or(ws.meta.stats.min_ts).unwrap_or(0);
+    let h_to = req.to.or(ws.meta.stats.max_ts.map(|t| t + 1)).unwrap_or(h_from + 1);
+    let step = bucket_step(h_from, h_to);
+    let h_start = h_from.div_euclid(step) * step;
+    let n_buckets = ((h_to - h_start + step - 1) / step).max(1) as usize;
+
+    let parts = scan_chunks(
+        ws,
+        &q,
+        from,
+        to,
+        cancel,
+        || (0u64, vec![[0u64; 7]; n_buckets]),
+        |(total, buckets), _, meta, _, ev, _| {
+            *total += 1;
+            let b = ((ev.ts - h_start) / step).clamp(0, n_buckets as i64 - 1) as usize;
+            buckets[b][meta.level as usize] += 1;
+        },
+    )?;
+    let mut total = 0;
+    let mut buckets = vec![[0u64; 7]; n_buckets];
+    let mut chunks_scanned = 0;
+    let mut events_scanned = 0;
+    for ((t, b), scanned, events) in parts {
+        total += t;
+        chunks_scanned += scanned;
+        events_scanned += events;
+        for (dst, src) in buckets.iter_mut().zip(&b) {
+            for l in 0..7 {
+                dst[l] += src[l];
+            }
+        }
+    }
+    Ok(Aggregates {
+        total,
+        histogram: Histogram {
+            start: h_start,
+            step,
+            buckets,
+        },
+        took_ms: started.elapsed().as_millis() as u64,
+        chunks_scanned,
+        chunks_total: ws.meta.chunks.len() as u64,
+        events_scanned,
+        cancelled: cancel.load(Ordering::Relaxed),
+    })
+}
+
+/// Rows plus, unless `rows_only`, the aggregates, one after the other (CLI and tests).
+pub fn search(ws: &Workspace, req: &SearchRequest, cancel: &AtomicBool) -> Result<SearchResult, SearchError> {
+    let mut res = rows(ws, req, cancel)?;
+    if !req.rows_only {
+        let aggs = aggregate(ws, req, cancel)?;
+        res.total = Some(aggs.total);
+        res.histogram = Some(aggs.histogram);
+        res.took_ms += aggs.took_ms;
+        res.chunks_scanned += aggs.chunks_scanned;
+        res.events_scanned += aggs.events_scanned;
+        res.cancelled = aggs.cancelled;
+    }
+    Ok(res)
 }

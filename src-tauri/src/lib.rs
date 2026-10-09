@@ -6,7 +6,7 @@ use logcore::export::ExportFormat;
 use logcore::ingest::{FolderPreview, Progress};
 use logcore::labels::LabelInfo;
 use logcore::query::{parse, Query};
-use logcore::search::{SearchError, SearchRequest, SearchResult};
+use logcore::search::{Aggregates, SearchError, SearchRequest, SearchResult};
 use logcore::store::{FileEntry, FolderSettings, Workspace};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 struct AppState {
     workspace: RwLock<Option<Arc<Workspace>>>,
     indexing: Mutex<Option<Arc<Progress>>>,
-    /// Cancel flag of the running search; a new search cancels the previous one.
+    /// Cancel flags of the running row and aggregate scans; a new query cancels the previous one.
     search_cancel: Mutex<Arc<AtomicBool>>,
+    aggregate_cancel: Mutex<Arc<AtomicBool>>,
 }
 
 /// Error returned to the UI. Query errors carry the span to underline in the editor.
@@ -201,16 +202,33 @@ fn workspace_info(state: State<'_, AppState>) -> Option<WorkspaceInfo> {
     state.workspace.read().as_ref().map(|ws| info(ws))
 }
 
+/// Replaces the cancel flag in `slot`, cancelling whatever scan held the old one.
+fn supersede(slot: &Mutex<Arc<AtomicBool>>) -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut slot = slot.lock();
+    slot.store(true, Ordering::Relaxed);
+    *slot = cancel.clone();
+    cancel
+}
+
+/// One page of rows. The UI calls `aggregate` alongside for the count and histogram.
 #[tauri::command]
 async fn search(state: State<'_, AppState>, request: SearchRequest) -> CmdResult<SearchResult> {
     let ws = current(&state)?;
-    let cancel = Arc::new(AtomicBool::new(false));
-    if !request.rows_only {
-        let mut slot = state.search_cancel.lock();
-        slot.store(true, Ordering::Relaxed);
-        *slot = cancel.clone();
-    }
-    blocking(move || Ok(logcore::search(&ws, &request, &cancel)?)).await
+    // "Load more" must not cancel the query whose page it extends.
+    let cancel = if request.after.is_some() {
+        Arc::new(AtomicBool::new(false))
+    } else {
+        supersede(&state.search_cancel)
+    };
+    blocking(move || Ok(logcore::search::rows(&ws, &request, &cancel)?)).await
+}
+
+#[tauri::command]
+async fn aggregate(state: State<'_, AppState>, request: SearchRequest) -> CmdResult<Aggregates> {
+    let ws = current(&state)?;
+    let cancel = supersede(&state.aggregate_cancel);
+    blocking(move || Ok(logcore::search::aggregate(&ws, &request, &cancel)?)).await
 }
 
 #[tauri::command]
@@ -319,6 +337,7 @@ pub fn run() {
             cancel_indexing,
             workspace_info,
             search,
+            aggregate,
             labels,
             parse_query,
             format_query,

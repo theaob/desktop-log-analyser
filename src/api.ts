@@ -18,7 +18,13 @@ export interface FolderSettings {
 
 export const defaultSettings = (): FolderSettings => ({ include: [], exclude: [], patterns: [], timeZone: { kind: "local" } });
 
-export type FormatInfo = { kind: "log4j"; pattern: string } | { kind: "jsonLines" } | { kind: "plain"; timestamped: boolean };
+export type FormatInfo =
+  | { kind: "log4j"; pattern: string }
+  | { kind: "jsonLines" }
+  | { kind: "xml" }
+  | { kind: "syslog" }
+  | { kind: "logfmt" }
+  | { kind: "plain"; timestamped: boolean };
 
 export interface FileEntry {
   rel: string;
@@ -129,6 +135,16 @@ export interface SearchResult {
   cancelled: boolean;
 }
 
+export interface Aggregates {
+  total: number;
+  histogram: Histogram;
+  tookMs: number;
+  chunksScanned: number;
+  chunksTotal: number;
+  eventsScanned: number;
+  cancelled: boolean;
+}
+
 export interface LabelInfo {
   name: string;
   stream: boolean;
@@ -177,6 +193,7 @@ export const api = {
   cancelIndexing: () => invoke<void>("cancel_indexing"),
   workspaceInfo: () => invoke<WorkspaceInfo | null>("workspace_info"),
   search: (request: SearchRequest) => invoke<SearchResult>("search", { request }),
+  aggregate: (request: SearchRequest) => invoke<Aggregates>("aggregate", { request }),
   labels: () => invoke<LabelInfo[]>("labels"),
   parseQuery: (text: string) => invoke<{ query: Query | null; error: CmdError | null }>("parse_query", { text }),
   formatQuery: (query: Query) => invoke<string>("format_query", { query }),

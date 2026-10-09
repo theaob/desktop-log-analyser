@@ -1,7 +1,7 @@
 //! Building a workspace: discover files, detect each file's format, parse events in
 //! parallel and write compressed chunks to the segment file.
 
-use crate::chunk::{ChunkBuilder, ChunkMeta};
+use crate::chunk::{ChunkBuilder, ChunkMeta, FinishedChunk};
 use crate::discover::{discover, SourceFile};
 use crate::log4j::CompiledPattern;
 use crate::model::{Event, Level};
@@ -151,10 +151,7 @@ impl FileStats {
 struct Sealed {
     file: u32,
     level: u8,
-    bytes: Vec<u8>,
-    count: u32,
-    min_ts: i64,
-    max_ts: i64,
+    chunk: FinishedChunk,
 }
 
 /// Opens the workspace for `root`, rebuilding it when files or settings changed.
@@ -201,27 +198,35 @@ fn build(
         .store(files.iter().map(|f| f.size).sum(), Ordering::Relaxed);
 
     let tmp_path = dir.join("segments.tmp");
+    let tmp_blooms = dir.join("blooms.tmp");
     let (tx, rx) = crossbeam_channel::bounded::<Sealed>(64);
     let writer = {
-        let tmp_path = tmp_path.clone();
+        let (tmp_path, tmp_blooms) = (tmp_path.clone(), tmp_blooms.clone());
         std::thread::spawn(move || -> anyhow::Result<Vec<ChunkMeta>> {
             let mut out = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp_path)?);
-            let mut offset = 0u64;
+            let mut blooms = std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp_blooms)?);
+            let (mut offset, mut bloom_offset) = (0u64, 0u64);
             let mut metas = Vec::new();
             for s in rx {
-                out.write_all(&s.bytes)?;
+                let c = s.chunk;
+                out.write_all(&c.bytes)?;
+                blooms.write_all(&c.bloom)?;
                 metas.push(ChunkMeta {
                     file: s.file,
                     level: s.level,
-                    min_ts: s.min_ts,
-                    max_ts: s.max_ts,
-                    count: s.count,
+                    min_ts: c.min_ts,
+                    max_ts: c.max_ts,
+                    count: c.count,
                     offset,
-                    len: s.bytes.len() as u32,
+                    len: c.bytes.len() as u32,
+                    bloom_offset,
+                    bloom_len: c.bloom.len() as u32,
                 });
-                offset += s.bytes.len() as u64;
+                offset += c.bytes.len() as u64;
+                bloom_offset += c.bloom.len() as u64;
             }
             out.flush()?;
+            blooms.flush()?;
             Ok(metas)
         })
     };
@@ -255,14 +260,11 @@ fn build(
                     builders[level].push(&ev);
                     events += 1;
                     if builders[level].is_full() {
-                        let (bytes, count, min_ts, max_ts) = builders[level].finish();
+                        let chunk = builders[level].finish();
                         let _ = tx.send(Sealed {
                             file: idx as u32,
                             level: level as u8,
-                            bytes,
-                            count,
-                            min_ts,
-                            max_ts,
+                            chunk,
                         });
                     }
                 };
@@ -277,14 +279,11 @@ fn build(
                 }
                 for (level, b) in builders.iter_mut().enumerate() {
                     if !b.is_empty() {
-                        let (bytes, count, min_ts, max_ts) = b.finish();
+                        let chunk = b.finish();
                         let _ = tx.send(Sealed {
                             file: idx as u32,
                             level: level as u8,
-                            bytes,
-                            count,
-                            min_ts,
-                            max_ts,
+                            chunk,
                         });
                     }
                 }
@@ -306,6 +305,7 @@ fn build(
         .map_err(|_| anyhow::anyhow!("segment writer panicked"))??;
     if progress.cancel.load(Ordering::Relaxed) {
         let _ = std::fs::remove_file(&tmp_path);
+        let _ = std::fs::remove_file(&tmp_blooms);
         anyhow::bail!("indexing cancelled");
     }
 
@@ -347,6 +347,9 @@ fn build(
     let _ = std::fs::remove_file(dir.join("meta.json"));
     let _ = std::fs::remove_file(&seg_path);
     std::fs::rename(&tmp_path, &seg_path)?;
+    let bloom_path = dir.join("blooms.bin");
+    let _ = std::fs::remove_file(&bloom_path);
+    std::fs::rename(&tmp_blooms, &bloom_path)?;
     std::fs::write(dir.join("meta.json"), serde_json::to_vec(&meta)?)?;
     Workspace::from_parts(root, dir, settings, meta)
 }

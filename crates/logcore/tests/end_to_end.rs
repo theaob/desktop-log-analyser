@@ -148,3 +148,91 @@ fn index_search_page_and_export() {
     let again = open_or_build(logs.path(), data.path(), None, &Progress::default(), false).unwrap();
     assert_eq!(again.meta.indexed_at_ms, ws.meta.indexed_at_ms);
 }
+
+/// Paging with early termination must return exactly what a full sort would, in both
+/// directions, across many interleaved chunks; exact field matchers prune by Bloom filter.
+#[test]
+fn paging_across_many_chunks_matches_full_order() {
+    let logs = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let base = 1_791_000_000_000i64;
+    for f in 0..3 {
+        let mut text = String::new();
+        for i in 0..9000i64 {
+            // Files overlap in time; levels alternate so each file splits into several chunks.
+            let ts = base + i * 1000 + f * 333;
+            let level = ["INFO", "WARN", "ERROR"][(i % 3) as usize];
+            let dt = chrono::DateTime::from_timestamp_millis(ts).unwrap();
+            text.push_str(&format!(
+                "{} [t{f}] {level:<5} com.acme.App [req-{f}-{i}] - event {i}\n",
+                dt.format("%Y-%m-%d %H:%M:%S%.3f")
+            ));
+        }
+        std::fs::write(logs.path().join(format!("svc{f}.log")), text).unwrap();
+    }
+    let ws = open_or_build(logs.path(), data.path(), settings(), &Progress::default(), false).unwrap();
+    assert_eq!(ws.meta.stats.events, 27_000);
+    assert!(ws.meta.chunks.len() >= 9);
+    let no_cancel = AtomicBool::new(false);
+
+    for direction in [Direction::Backward, Direction::Forward] {
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let page = logcore::search::rows(
+                &ws,
+                &SearchRequest {
+                    query: r#"{level=~"warn|error"}"#.into(),
+                    limit: Some(700),
+                    direction,
+                    after,
+                    ..Default::default()
+                },
+                &no_cancel,
+            )
+            .unwrap();
+            seen.extend(page.rows.iter().map(|r| r.key));
+            after = page.next;
+            if after.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 18_000);
+        let mut sorted = seen.clone();
+        sorted.sort();
+        if direction == Direction::Backward {
+            sorted.reverse();
+        }
+        assert_eq!(seen, sorted, "{direction:?}");
+    }
+
+    // The newest page only touches the newest chunks.
+    let first = logcore::search::rows(
+        &ws,
+        &SearchRequest {
+            query: "{}".into(),
+            limit: Some(100),
+            ..Default::default()
+        },
+        &no_cancel,
+    )
+    .unwrap();
+    assert!(
+        first.chunks_scanned < ws.meta.chunks.len() as u64,
+        "{}",
+        first.chunks_scanned
+    );
+    assert_eq!(first.rows[0].message.split(" - ").last(), Some("event 8999"));
+
+    let one = logcore::search(
+        &ws,
+        &SearchRequest {
+            query: r#"{requestId="req-1-4242"}"#.into(),
+            ..Default::default()
+        },
+        &no_cancel,
+    )
+    .unwrap();
+    assert_eq!(one.total, Some(1));
+    assert!(one.chunks_scanned <= 4, "bloom should prune: {}", one.chunks_scanned);
+}

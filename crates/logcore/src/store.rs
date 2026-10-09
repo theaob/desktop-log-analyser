@@ -13,7 +13,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 /// Bumped whenever the segment or metadata layout changes; older workspaces are rebuilt.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -74,6 +74,8 @@ pub struct Workspace {
     pub settings: FolderSettings,
     pub meta: WorkspaceMeta,
     segments: File,
+    /// All chunks' Bloom filters, kept in memory (a few bytes per distinct field value).
+    blooms: Vec<u8>,
 }
 
 pub fn hash_hex(s: &str) -> String {
@@ -116,14 +118,7 @@ impl Workspace {
         if meta.version != FORMAT_VERSION {
             anyhow::bail!("workspace format {} is outdated", meta.version);
         }
-        let segments = File::open(dir.join("segments.bin"))?;
-        Ok(Workspace {
-            root: root.to_path_buf(),
-            dir: dir.to_path_buf(),
-            settings: load_settings(dir),
-            meta,
-            segments,
-        })
+        Self::from_parts(root, dir, load_settings(dir), meta)
     }
 
     pub(crate) fn from_parts(
@@ -133,12 +128,14 @@ impl Workspace {
         meta: WorkspaceMeta,
     ) -> anyhow::Result<Workspace> {
         let segments = File::open(dir.join("segments.bin"))?;
+        let blooms = std::fs::read(dir.join("blooms.bin"))?;
         Ok(Workspace {
             root: root.to_path_buf(),
             dir: dir.to_path_buf(),
             settings,
             meta,
             segments,
+            blooms,
         })
     }
 
@@ -152,6 +149,12 @@ impl Workspace {
                 .iter()
                 .zip(files)
                 .all(|(a, b)| a.file.rel == b.rel && a.file.size == b.size && a.file.mtime_ms == b.mtime_ms)
+    }
+
+    /// The chunk's Bloom filter over `field=value` pairs (empty: matches everything).
+    pub fn bloom(&self, meta: &ChunkMeta) -> &[u8] {
+        let start = meta.bloom_offset as usize;
+        self.blooms.get(start..start + meta.bloom_len as usize).unwrap_or(&[])
     }
 
     /// Reads and decompresses a chunk's body.

@@ -20,6 +20,12 @@ export function formatName(f: FormatInfo | null): string {
       return "log4j pattern";
     case "jsonLines":
       return "JSON lines";
+    case "xml":
+      return "log4j XML";
+    case "syslog":
+      return "syslog";
+    case "logfmt":
+      return "logfmt";
     case "plain":
       return f.timestamped ? "plain text with timestamps" : "plain text";
   }
@@ -165,7 +171,7 @@ export default function OpenFolder({ initialPath, onOpened, onCancel }: Props) {
                   <strong>{s.source}</strong>
                   <span className="muted">
                     {s.files} file{s.files === 1 ? "" : "s"} · {formatBytes(s.bytes)} · {formatName(s.format)}
-                    {s.format.kind !== "jsonLines" && ` · ${Math.round(s.score * 100)}% of sample lines start an event`}
+                    {s.format.kind !== "jsonLines" && s.format.kind !== "xml" && ` · ${Math.round(s.score * 100)}% of sample lines start an event`}
                   </span>
                 </div>
                 {s.format.kind === "log4j" && <code className="pattern">{s.format.pattern}</code>}
