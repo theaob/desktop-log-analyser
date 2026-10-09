@@ -200,10 +200,9 @@ fn parse_json(line: &str, ctx: &ParseCtx) -> Option<Event> {
     }
     if ts.is_none() {
         ts = match get(json_keys::TIMESTAMP) {
-            Some(serde_json::Value::Number(n)) => {
-                n.as_f64()
-                    .map(|f| if f > 1e11 { f as i64 } else { (f * 1000.0) as i64 })
-            }
+            Some(serde_json::Value::Number(n)) => n
+                .as_f64()
+                .map(|f| if f > 1e11 { f as i64 } else { (f * 1000.0) as i64 }),
             Some(serde_json::Value::String(s)) => generic_ts().find(s, ctx.tz, ctx.default_date).map(|(t, _)| t),
             _ => None,
         };
